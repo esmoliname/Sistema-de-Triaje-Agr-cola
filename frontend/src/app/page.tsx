@@ -114,8 +114,9 @@ export default function Home() {
     stopCamera();
 
     try {
-      // d) Petición POST al backend FastAPI
-      const response = await fetch('http://localhost:8000/api/analyze', {
+      // d) Petición POST al backend FastAPI (soporta túnel HTTPS dinámico o proxy Next.js)
+      const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || '';
+      const response = await fetch(`${BACKEND_URL}/api/analyze`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
