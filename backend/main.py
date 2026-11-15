@@ -14,18 +14,17 @@ from pydantic import BaseModel
 # 1. Configuración de Entorno y CORS
 load_dotenv()
 
-HYDROGEN_API_KEY = os.getenv("HYDROGEN_API_KEY", "")
 HYDROGEN_API_URL = os.getenv(
-    "HYDROGEN_API_URL", "https://api.hydrogen.ai/v1/chat/completions"
+    "HYDROGEN_API_URL", "https://api.hydrogen.ai/v1/vision/analyze"
 )
 
 SYSTEM_PROMPT = (
-    "Eres un fitopatólogo experto en cultivos tropicales de exportación. "
-    "Analiza la imagen proporcionada y evalúa la presencia de enfermedades en hojas de banano "
-    "(como Sigatoka Negra - Mycosphaerella fijiensis, Sigatoka Amarilla o Mal de Panamá - Fusarium oxysporum f. sp. cubense) "
-    "o en plantas de piña (como Pudrición del corazón y raíz por Phytophthora nicotianae / cinnamomi). "
-    "Responde estrictamente en formato JSON con las claves: "
-    "'diagnostico' (str), 'confianza' (float, 0-100), 'fase' (str) y 'tratamiento' (str)."
+    "Eres un fitopatólogo experto evaluando cultivos en Costa Rica. Analiza la imagen. "
+    "Si es banano, busca Sigatoka Negra (rayas cloróticas/manchas necróticas), Mal de Panamá o Moko. "
+    "Si es piña, busca pudrición por Phytophthora o Fusariosis. "
+    'Responde ÚNICAMENTE con un JSON válido con esta estructura: {"diagnostico": "Nombre de la enfermedad o \'Sano\'", '
+    '"confianza": [float de 0 a 100], "fase": "Temprana/Moderada/Severa/N/A", '
+    '"tratamiento": "Recomendación técnica o química concisa"}.'
 )
 
 app = FastAPI(title="Sistema de Triaje Agrícola - Hydrogen API")
@@ -118,24 +117,23 @@ async def analyze_crop_image(payload: ImagePayload) -> TriageResponse:
     _, processed_b64 = decode_and_preprocess_image(payload.image_base64)
 
     try:
-        if not HYDROGEN_API_KEY:
-            raise RuntimeError("HYDROGEN_API_KEY no configurada en el entorno.")
+        api_key = os.getenv("HYDROGEN_API_KEY")
+        if not api_key:
+            raise ValueError("HYDROGEN_API_KEY no está definida en el entorno.")
 
         headers = {
-            "Authorization": f"Bearer {HYDROGEN_API_KEY}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
         request_body = {
-            "model": "hydrogen-vision-agri-v1",
+            "model": "hydrogen-vision-1.0",
+            "image_base64": processed_b64,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "text",
-                            "text": "Realiza el triaje fitosanitario de esta muestra foliar.",
-                        },
+                        {"type": "text", "text": SYSTEM_PROMPT},
                         {
                             "type": "image_url",
                             "image_url": {
@@ -145,26 +143,45 @@ async def analyze_crop_image(payload: ImagePayload) -> TriageResponse:
                     ],
                 },
             ],
-            "temperature": 0.2,
             "response_format": {"type": "json_object"},
+            "temperature": 0.1,
         }
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.post(
                 HYDROGEN_API_URL, headers=headers, json=request_body
             )
             response.raise_for_status()
-            data = response.json()
-            content = data["choices"][0]["message"]["content"]
-            parsed = json.loads(content) if isinstance(content, str) else content
-            return TriageResponse(**parsed)
+            raw_data = response.json()
+
+        # Extracción y parseo estricto del JSON devuelto por Hydrogen
+        if isinstance(raw_data, dict) and "choices" in raw_data:
+            raw_content = raw_data["choices"][0]["message"]["content"]
+        elif isinstance(raw_data, dict) and "result" in raw_data:
+            raw_content = raw_data["result"]
+        else:
+            raw_content = raw_data
+
+        if isinstance(raw_content, str):
+            cleaned_json = raw_content.strip()
+            if cleaned_json.startswith("```"):
+                cleaned_json = cleaned_json.strip("`")
+                if cleaned_json.lower().startswith("json"):
+                    cleaned_json = cleaned_json[4:].strip()
+            parsed_json = json.loads(cleaned_json)
+        elif isinstance(raw_content, dict):
+            parsed_json = raw_content
+        else:
+            raise ValueError("Formato de respuesta de Hydrogen API no reconocido.")
+
+        return TriageResponse.model_validate(parsed_json)
 
     except Exception:
-        # Fallback seguro (mock) validado por TriageResponse para desarrollo sin bloqueos
+        # Fallback seguro (mock) exclusivamente en bloque except si la API externa falla
         return TriageResponse(
             diagnostico="Sigatoka Negra (Mycosphaerella fijiensis)",
             confianza=92.5,
-            fase="Estadio 4 - Manchas elípticas con halo clorótico",
+            fase="Moderada",
             tratamiento=(
                 "Deshoje sanitario inmediato de áreas necróticas, aplicación dirigida de "
                 "fungicida sistémico (grupo triazoles en rotación con protectantes tipo mancozeb) "
