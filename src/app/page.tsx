@@ -1,13 +1,15 @@
 'use client';
 
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, ChangeEvent } from 'react';
 
 interface TriageResponse {
   diagnostico: string;
-  confianza: number;
+  confianza: number | string;
   fase: string;
   tratamiento: string;
 }
+
+const MAX_WIDTH = 800;
 
 const SYSTEM_PROMPT = `
 [ROL Y CONTEXTO]
@@ -45,6 +47,7 @@ B. PIÑA (Ananas comosus):
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
   const [isCameraActive, setIsCameraActive] = useState<boolean>(false);
@@ -94,7 +97,7 @@ export default function Home() {
       }
     } catch {
       setError(
-        'No se pudo acceder a la cámara. Verifica los permisos del navegador o conecta un dispositivo de captura.'
+        'No se pudo acceder a la cámara en vivo. Puedes usar "Subir / Tomar Foto" como alternativa directa.'
       );
       setIsCameraActive(false);
     }
@@ -117,38 +120,18 @@ export default function Home() {
     };
   }, []);
 
-  const captureAndAnalyze = async () => {
-    if (!videoRef.current || !canvasRef.current) {
-      setError('El visor de cámara no está disponible para capturar el frame.');
+  // Función centralizada para enviar Base64 comprimido a Gemini REST API
+  const analyzeCompressedBase64 = async (imageBase64: string) => {
+    const cleanBase64 = imageBase64.includes(',')
+      ? imageBase64.split(',')[1]
+      : imageBase64;
+
+    if (!cleanBase64) {
+      setError('No se pudo codificar la imagen en formato JPEG.');
       return;
     }
 
     setError('');
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-
-    canvas.width = video.videoWidth || 640;
-    canvas.height = video.videoHeight || 480;
-
-    const context = canvas.getContext('2d');
-    if (!context) {
-      setError('No se pudo inicializar el contexto gráfico 2D del lienzo.');
-      return;
-    }
-
-    // a) Dibuja el frame actual del <video> en el <canvas>
-    context.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-    // b) Extrae la imagen en Base64 usando canvas.toDataURL('image/jpeg') y limpia el prefijo
-    const imageBase64 = canvas.toDataURL('image/jpeg');
-    const cleanBase64 = imageBase64.split(',')[1];
-
-    if (!cleanBase64) {
-      setError('No se pudo codificar la captura de la cámara en formato JPEG.');
-      return;
-    }
-
-    // c) Activa el estado de carga y detiene la cámara temporalmente
     setIsLoading(true);
     stopCamera();
 
@@ -160,7 +143,6 @@ export default function Home() {
         );
       }
 
-      // d) Llamado REST directo a la API de Gemini
       const response = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
         {
@@ -194,7 +176,6 @@ export default function Home() {
         );
       }
 
-      // e) Extrae el texto de data.candidates[0].content.parts[0].text, limpia Markdown y parsea JSON
       const data = await response.json();
       const rawText: string | undefined =
         data?.candidates?.[0]?.content?.parts?.[0]?.text;
@@ -222,11 +203,122 @@ export default function Home() {
       const message =
         err instanceof Error
           ? err.message
-          : 'Error al conectar con la API de análisis fitosanitario.';
+          : 'Error de conexión o imagen muy pesada.';
       setError(message);
+      setResult({
+        diagnostico: 'Error de conexión o imagen muy pesada',
+        confianza: '0%',
+        fase: 'N/A',
+        tratamiento: 'Reintenta con una foto más ligera.',
+      });
     } finally {
       setIsLoading(false);
     }
+  };
+
+  // 1. Captura desde el stream de video con redimensionamiento a MAX_WIDTH (800px) y JPEG 0.7
+  const captureAndAnalyze = async () => {
+    if (!videoRef.current || !canvasRef.current) {
+      setError('El visor de cámara no está disponible para capturar el frame.');
+      return;
+    }
+
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+
+    const sourceWidth = video.videoWidth || 640;
+    const sourceHeight = video.videoHeight || 480;
+
+    const targetWidth = Math.min(sourceWidth, MAX_WIDTH);
+    const scaleFactor = targetWidth / sourceWidth;
+    const targetHeight = Math.round(sourceHeight * scaleFactor);
+
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+
+    const context = canvas.getContext('2d');
+    if (!context) {
+      setError('No se pudo inicializar el contexto gráfico 2D del lienzo.');
+      return;
+    }
+
+    context.drawImage(video, 0, 0, targetWidth, targetHeight);
+    const compressedBase64 = canvas.toDataURL('image/jpeg', 0.7);
+
+    await analyzeCompressedBase64(compressedBase64);
+  };
+
+  // 2. Subida / captura nativa de archivo con FileReader + Image() + compresión en canvas temporal (800px, JPEG 0.7)
+  const handleFileUpload = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+
+    setError('');
+    setResult(null);
+    setIsLoading(true);
+    stopCamera();
+
+    const reader = new FileReader();
+
+    reader.onerror = () => {
+      setIsLoading(false);
+      setError('No se pudo leer el archivo seleccionado.');
+      setResult({
+        diagnostico: 'Error de conexión o imagen muy pesada',
+        confianza: '0%',
+        fase: 'N/A',
+        tratamiento: 'Reintenta con una foto más ligera.',
+      });
+    };
+
+    reader.onload = () => {
+      const dataUrl = reader.result as string;
+      const img = new Image();
+
+      img.onerror = () => {
+        setIsLoading(false);
+        setError('El archivo seleccionado no es una imagen válida.');
+        setResult({
+          diagnostico: 'Error de conexión o imagen muy pesada',
+          confianza: '0%',
+          fase: 'N/A',
+          tratamiento: 'Reintenta con una foto más ligera.',
+        });
+      };
+
+      img.onload = () => {
+        const tempCanvas = document.createElement('canvas');
+        const origWidth = img.naturalWidth || img.width || 800;
+        const origHeight = img.naturalHeight || img.height || 600;
+
+        const targetWidth = Math.min(origWidth, MAX_WIDTH);
+        const scale = targetWidth / origWidth;
+        const targetHeight = Math.round(origHeight * scale);
+
+        tempCanvas.width = targetWidth;
+        tempCanvas.height = targetHeight;
+
+        const ctx = tempCanvas.getContext('2d');
+        if (!ctx) {
+          setIsLoading(false);
+          setError('No se pudo procesar la imagen en memoria.');
+          return;
+        }
+
+        ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+        const compressedBase64 = tempCanvas.toDataURL('image/jpeg', 0.7);
+
+        void analyzeCompressedBase64(compressedBase64);
+      };
+
+      img.src = dataUrl;
+    };
+
+    reader.readAsDataURL(file);
+    // Limpia el valor del input para permitir volver a subir la misma foto si se desea
+    event.target.value = '';
   };
 
   const handleNewScan = () => {
@@ -234,6 +326,16 @@ export default function Home() {
     setError('');
     startCamera();
   };
+
+  const numericConfidence =
+    typeof result?.confianza === 'number'
+      ? result.confianza
+      : parseFloat(String(result?.confianza ?? '0')) || 0;
+
+  const formattedConfidence =
+    typeof result?.confianza === 'number'
+      ? `${result.confianza.toFixed(1)}%`
+      : String(result?.confianza ?? '0%');
 
   return (
     <main className="min-h-screen w-full px-4 py-10 sm:px-8 flex flex-col items-center justify-start">
@@ -291,7 +393,7 @@ export default function Home() {
                   <>
                     <div className="w-12 h-12 rounded-full border-2 border-emerald-400 border-t-transparent animate-spin" />
                     <p className="text-base font-medium cyber-text-glow">
-                      Analizando muestra foliar con Gemini Vision...
+                      Comprimiendo muestra (800px) y consultando Gemini Vision...
                     </p>
                     <p className="text-xs font-mono text-emerald-200/60">
                       EVALUANDO PATRONES DE NECROSIS Y CLOROSIS FOLIAR
@@ -304,8 +406,8 @@ export default function Home() {
                     </div>
                     <p className="text-sm sm:text-base text-emerald-100/80">
                       {result
-                        ? 'Captura completada. Revisa el informe fitosanitario inferior o inicia un nuevo escaneo.'
-                        : 'Activa la cámara trasera para enfocar la muestra foliar dentro del retículo de escaneo.'}
+                        ? 'Captura procesada. Revisa el informe fitosanitario inferior o inicia un nuevo escaneo.'
+                        : 'Activa la cámara en vivo o usa "Subir / Tomar Foto" para analizar una muestra foliar.'}
                     </p>
                   </>
                 )}
@@ -315,6 +417,17 @@ export default function Home() {
 
           {/* Canvas oculto para captura de frame */}
           <canvas ref={canvasRef} className="hidden" />
+
+          {/* Input oculto para subida o captura nativa de archivo en iOS/Android */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            capture="environment"
+            id="file-upload"
+            onChange={handleFileUpload}
+            className="hidden"
+          />
 
           {/* Mensajes de Error */}
           {error && (
@@ -351,6 +464,16 @@ export default function Home() {
                 {isLoading ? 'Analizando...' : 'Escanear Hoja'}
               </button>
             )}
+
+            <button
+              id="btn-upload-photo"
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isLoading}
+              className="cyber-button"
+            >
+              Subir / Tomar Foto
+            </button>
 
             {(result || isCameraActive || error) && (
               <button
@@ -389,14 +512,14 @@ export default function Home() {
                   Nivel de Confianza Biométrica
                 </span>
                 <span className="text-xl font-bold font-mono cyber-text-glow">
-                  {result.confianza.toFixed(1)}%
+                  {formattedConfidence}
                 </span>
               </div>
               <div className="w-full h-3 rounded-full bg-emerald-950/80 border border-emerald-500/30 overflow-hidden">
                 <div
                   className="h-full rounded-full bg-gradient-to-r from-emerald-500 to-teal-300 transition-all duration-500"
                   style={{
-                    width: `${Math.min(Math.max(result.confianza, 0), 100)}%`,
+                    width: `${Math.min(Math.max(numericConfidence, 0), 100)}%`,
                   }}
                 />
               </div>
