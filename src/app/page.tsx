@@ -9,6 +9,39 @@ interface TriageResponse {
   tratamiento: string;
 }
 
+const SYSTEM_PROMPT = `
+[ROL Y CONTEXTO]
+Actúas como un Fitopatólogo Senior y Científico de Datos Agrícolas especializado en el clima tropical de Costa Rica. Tu tarea es analizar de forma microscópica y macroscópica imágenes de hojas, tallos o frutos de cultivos comerciales (exclusivamente Banano y Piña).
+
+[PROTOCOLO DE ANÁLISIS VISUAL MULTIMODAL]
+Al recibir la imagen, debes procesar los siguientes vectores visuales antes de emitir un diagnóstico:
+1. Análisis de Clorosis y Necrosis: Mapea bordes amarillentos, halos de muerte celular, estrías o manchas concéntricas.
+2. Identificación de Vectores Biológicos: Busca signos de micelio, esporulación, o daños por plagas secundarias (ej. cochinillas).
+3. Descarte de Ruido: Ignora dedos, guantes, reflejos del sol o tierra de fondo. Si la imagen NO es de una planta, o la calidad es ilegible, cataloga como 'Análisis Inválido'.
+
+[TAXONOMÍA DE PATOLOGÍAS REQUERIDAS]
+A. BANANO (Musa spp.):
+   - Sigatoka Negra (Mycosphaerella fijiensis): Rayas cloróticas rojizas/marrones que evolucionan a manchas necróticas negras con halos amarillos.
+   - Mal de Panamá (Fusarium oxysporum): Amarillamiento progresivo desde las hojas más viejas hacia las jóvenes, marchitez vascular.
+   - Moko (Ralstonia solanacearum): Amarillamiento rápido y necrosis central, hojas que se doblan en la base del pecíolo.
+B. PIÑA (Ananas comosus):
+   - Pudrición por Phytophthora: Decoloración gris-verde en hojas centrales, fácil desprendimiento del cogollo, olor a fermentación.
+   - Fusariosis (Fusarium guttiforme): Exudado gomoso en el fruto, curvatura del tallo.
+   - Marchitez por Cochinilla (PMWaV): Enrojecimiento/rosado en los márgenes de las hojas, enrollamiento de las puntas hacia abajo.
+
+[REGLAS ESTRICTAS DE SALIDA]
+- Eres un sistema de backend. NUNCA respondas con texto conversacional, saludos, ni justificaciones.
+- Tu ÚNICA salida permitida es un objeto JSON puro. NUNCA envuelvas la respuesta en bloques de código Markdown (ej. \`\`\`json).
+- El JSON debe cumplir estrictamente esta estructura:
+
+{
+  "diagnostico": "[Nombre exacto de la enfermedad, 'Sano', o 'Análisis Inválido']",
+  "confianza": [Valor numérico tipo float entre 0.0 y 100.0 reflejando tu certeza visual],
+  "fase": "[Debe ser exclusivamente: 'Temprana', 'Moderada', 'Severa', o 'N/A']",
+  "tratamiento": "[Instrucción técnica directa, máxima 150 caracteres. Ej: 'Aplicar fungicida sistémico triazol y realizar deshoje sanitario.']"
+}
+`.trim();
+
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -106,38 +139,90 @@ export default function Home() {
     // a) Dibuja el frame actual del <video> en el <canvas>
     context.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-    // b) Extrae la imagen en Base64 usando canvas.toDataURL('image/jpeg')
-    const base64Image = canvas.toDataURL('image/jpeg');
+    // b) Extrae la imagen en Base64 usando canvas.toDataURL('image/jpeg') y limpia el prefijo
+    const imageBase64 = canvas.toDataURL('image/jpeg');
+    const cleanBase64 = imageBase64.split(',')[1];
+
+    if (!cleanBase64) {
+      setError('No se pudo codificar la captura de la cámara en formato JPEG.');
+      return;
+    }
 
     // c) Activa el estado de carga y detiene la cámara temporalmente
     setIsLoading(true);
     stopCamera();
 
     try {
-      // d) Petición POST a la ruta serverless nativa de Next.js (/api/analyze)
-      const response = await fetch('/api/analyze', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ image_base64: base64Image }),
-      });
+      const apiKey = process.env.NEXT_PUBLIC_HYDROGEN_API_KEY;
+      if (!apiKey) {
+        throw new Error(
+          'Falta configurar NEXT_PUBLIC_HYDROGEN_API_KEY en el entorno de compilación.'
+        );
+      }
+
+      // d) Llamado REST directo a la API de Gemini
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            contents: [
+              {
+                parts: [
+                  { text: SYSTEM_PROMPT },
+                  {
+                    inlineData: {
+                      mimeType: 'image/jpeg',
+                      data: cleanBase64,
+                    },
+                  },
+                ],
+              },
+            ],
+          }),
+        }
+      );
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => null);
         throw new Error(
-          errorData?.detail || `Error del servidor (${response.status})`
+          errorData?.error?.message ||
+            `Error de Gemini API (${response.status})`
         );
       }
 
-      // e) Recibe TriageResponse y la guarda en result
-      const data: TriageResponse = await response.json();
-      setResult(data);
+      // e) Extrae el texto de data.candidates[0].content.parts[0].text, limpia Markdown y parsea JSON
+      const data = await response.json();
+      const rawText: string | undefined =
+        data?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+      if (!rawText) {
+        throw new Error('La respuesta de Gemini no contiene texto válido.');
+      }
+
+      const cleanedText = rawText
+        .trim()
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/\s*```$/i, '')
+        .trim();
+
+      const parsed: TriageResponse = JSON.parse(cleanedText);
+      setResult({
+        diagnostico: String(parsed.diagnostico ?? 'Análisis Inválido'),
+        confianza: Number(parsed.confianza ?? 0),
+        fase: String(parsed.fase ?? 'N/A'),
+        tratamiento: String(
+          parsed.tratamiento ?? 'Sin recomendación disponible.'
+        ),
+      });
     } catch (err) {
       const message =
         err instanceof Error
           ? err.message
-          : 'Error al conectar con el servidor de análisis fitosanitario.';
+          : 'Error al conectar con la API de análisis fitosanitario.';
       setError(message);
     } finally {
       setIsLoading(false);
@@ -206,7 +291,7 @@ export default function Home() {
                   <>
                     <div className="w-12 h-12 rounded-full border-2 border-emerald-400 border-t-transparent animate-spin" />
                     <p className="text-base font-medium cyber-text-glow">
-                      Procesando matriz OpenCV y consultando Hydrogen API...
+                      Analizando muestra foliar con Gemini Vision...
                     </p>
                     <p className="text-xs font-mono text-emerald-200/60">
                       EVALUANDO PATRONES DE NECROSIS Y CLOROSIS FOLIAR
